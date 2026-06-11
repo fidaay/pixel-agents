@@ -3,7 +3,7 @@ import type { AgentStateStore } from './agentStateStore.js';
 import type { LoadedAssets, LoadedCharacterSprites } from './assetLoader.js';
 import { readConfig, writeConfig } from './configPersistence.js';
 import { readLayoutFromFile, writeLayoutToFile } from './layoutPersistence.js';
-import { claudeProvider } from './providers/index.js';
+import { getProviderCapabilities } from './providers/capabilities.js';
 
 type WsSend = (message: Record<string, unknown>) => void;
 
@@ -136,8 +136,7 @@ function handleWebviewReady(send: WsSend, ctx: ClientMessageContext): void {
   // 1. Provider capabilities (must arrive before any agent messages)
   send({
     type: 'providerCapabilities',
-    readingTools: [...claudeProvider.readingTools],
-    subagentToolNames: [...claudeProvider.subagentToolNames],
+    ...getProviderCapabilities(),
   });
 
   // 2. Assets (from server cache, loaded at startup via pngjs)

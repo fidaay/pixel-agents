@@ -3,6 +3,7 @@ const debug = process.env.PIXEL_AGENTS_DEBUG !== '0';
 import type { HookProvider } from '../../core/src/provider.js';
 import type { AgentStateStore } from './agentStateStore.js';
 import { TEXT_IDLE_DELAY_MS, TOOL_DONE_DELAY_MS } from './constants.js';
+import { CODEX_SUBAGENT_TOOL_NAMES } from './providers/capabilities.js';
 import {
   cancelPermissionTimer,
   cancelWaitingTimer,
@@ -30,6 +31,10 @@ function isSubagentTool(toolName: string | null | undefined): boolean {
   return hookProvider.subagentToolNames.has(toolName);
 }
 
+function isCodexSubagentTool(toolName: string | null | undefined): boolean {
+  return typeof toolName === 'string' && CODEX_SUBAGENT_TOOL_NAMES.has(toolName);
+}
+
 /** Register the HookProvider that owns CLI-specific formatting and team metadata extraction. */
 export function setHookProvider(provider: HookProvider): void {
   hookProvider = provider;
@@ -39,6 +44,180 @@ export function setHookProvider(provider: HookProvider): void {
  *  Invariant: a provider is registered before any transcript lines are parsed. */
 export function formatToolStatus(toolName: string, input: Record<string, unknown>): string {
   return hookProvider?.formatToolStatus(toolName, input) ?? `Using ${toolName}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isCodexSessionMetaRecord(record: Record<string, unknown>): boolean {
+  if (record.type !== 'session_meta' || !isRecord(record.payload)) {
+    return false;
+  }
+
+  return typeof record.payload.id === 'string';
+}
+
+function formatCodexToolStatus(toolName: string): string {
+  switch (toolName) {
+    case 'shell_command':
+      return 'Running command';
+    case 'apply_patch':
+      return 'Editing files';
+    case 'spawn_agent':
+      return 'Subtask: Codex agent';
+    case 'wait_agent':
+      return 'Waiting for Codex agent';
+    case 'close_agent':
+      return 'Closing Codex agent';
+    case 'send_input':
+      return 'Messaging Codex agent';
+    case 'get_screenshot':
+      return 'Capturing screenshot';
+    case 'view_image':
+      return 'Viewing image';
+    default:
+      return `Using ${toolName}`;
+  }
+}
+
+function processCodexTranscriptRecord(
+  agentId: number,
+  record: Record<string, unknown>,
+  agents: AgentStateStore,
+  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+): boolean {
+  const agent = agents.get(agentId);
+  if (!agent) return true;
+
+  if (agent.providerId !== 'codex' && !isCodexSessionMetaRecord(record)) {
+    return false;
+  }
+
+  if (record.type === 'session_meta') {
+    const payload = record.payload as
+      | {
+          agent_nickname?: string;
+          agent_role?: string;
+        }
+      | undefined;
+
+    agent.providerId = 'codex';
+    if (payload?.agent_nickname || payload?.agent_role) {
+      agent.folderName = payload.agent_nickname
+        ? payload.agent_role
+          ? `${payload.agent_nickname} (${payload.agent_role})`
+          : payload.agent_nickname
+        : payload.agent_role;
+      agent.teamName = 'Codex';
+      agent.agentName = payload.agent_role;
+      agents.broadcast({
+        type: 'agentTeamInfo',
+        id: agentId,
+        teamName: agent.teamName,
+        agentName: agent.agentName,
+      });
+    }
+
+    return true;
+  }
+
+  if (record.type === 'event_msg') {
+    const payload = record.payload as { type?: string } | undefined;
+
+    if (payload?.type === 'task_started' || payload?.type === 'agent_message') {
+      cancelWaitingTimer(agentId, waitingTimers);
+      agent.isWaiting = false;
+      agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+    } else if (payload?.type === 'task_complete') {
+      agent.isWaiting = true;
+      agents.broadcast({ type: 'agentStatus', id: agentId, status: 'waiting' });
+    }
+
+    return true;
+  }
+
+  if (record.type !== 'response_item') {
+    return false;
+  }
+
+  const payload = record.payload as
+    | {
+        type?: string;
+        name?: string;
+        call_id?: string;
+      }
+    | undefined;
+
+  if (!payload?.type) return true;
+
+  if (payload.type === 'function_call' && payload.name && payload.call_id) {
+    const toolName = payload.name;
+    const toolId = payload.call_id;
+    const status = formatCodexToolStatus(toolName);
+
+    cancelWaitingTimer(agentId, waitingTimers);
+    agent.isWaiting = false;
+    agent.hadToolsInTurn = true;
+    agent.activeToolIds.add(toolId);
+    agent.activeToolStatuses.set(toolId, status);
+    agent.activeToolNames.set(toolId, toolName);
+    if (isCodexSubagentTool(toolName)) {
+      agent.activeSubagentToolIds.set(toolId, new Set());
+      agent.activeSubagentToolNames.set(toolId, new Map());
+    }
+
+    agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+    agents.broadcast({
+      type: 'agentToolStart',
+      id: agentId,
+      toolId,
+      status,
+      toolName,
+      permissionActive: false,
+    });
+
+    return true;
+  }
+
+  if (payload.type === 'function_call_output' && payload.call_id) {
+    const toolId = payload.call_id;
+    const toolName = agent.activeToolNames.get(toolId);
+
+    if (isCodexSubagentTool(toolName)) {
+      agent.activeSubagentToolIds.delete(toolId);
+      agent.activeSubagentToolNames.delete(toolId);
+      agents.broadcast({
+        type: 'subagentClear',
+        id: agentId,
+        parentToolId: toolId,
+      });
+    }
+
+    agent.activeToolIds.delete(toolId);
+    agent.activeToolStatuses.delete(toolId);
+    agent.activeToolNames.delete(toolId);
+
+    setTimeout(() => {
+      agents.broadcast({
+        type: 'agentToolDone',
+        id: agentId,
+        toolId,
+      });
+    }, TOOL_DONE_DELAY_MS);
+
+    if (agent.activeToolIds.size === 0) {
+      agent.hadToolsInTurn = false;
+    }
+
+    return true;
+  }
+
+  if (payload.type === 'message') {
+    return true;
+  }
+
+  return false;
 }
 
 export function processTranscriptLine(
@@ -54,6 +233,9 @@ export function processTranscriptLine(
   agent.linesProcessed++;
   try {
     const record = JSON.parse(line);
+    if (processCodexTranscriptRecord(agentId, record, agents, waitingTimers)) {
+      return;
+    }
 
     // -- Agent Teams: extract team metadata via the active provider --
     // The provider reads its CLI's own field names (Claude: record.teamName + record.agentName).

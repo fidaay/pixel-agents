@@ -29,6 +29,7 @@ import {
   watchLayoutFile,
   writeLayoutToFile,
 } from '../../server/src/layoutPersistence.js';
+import { getProviderCapabilities } from '../../server/src/providers/capabilities.js';
 import { claudeProvider, copyHookScript } from '../../server/src/providers/index.js';
 import { PixelAgentsServer } from '../../server/src/server.js';
 import {
@@ -39,6 +40,7 @@ import {
   sendExistingAgents,
   sendLayout,
 } from './agentManager.js';
+import { startCodexSessionWatcher } from './codexSessionWatcher.js';
 import {
   CONFIG_KEY_AUTO_SHOW_PANEL,
   CONFIG_KEY_AUTO_SPAWN_AGENT,
@@ -78,6 +80,8 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
   // Auto-spawn guard: ensures the startup spawn fires at most once per VS Code
   // session, even though webviewReady fires on every panel focus.
   private autoSpawnAttempted = false;
+
+  private codexSessionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -271,8 +275,7 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         // from the first frame.
         this.webview?.postMessage({
           type: 'providerCapabilities',
-          readingTools: [...claudeProvider.readingTools],
-          subagentToolNames: [...claudeProvider.subagentToolNames],
+          ...getProviderCapabilities(),
         });
         restoreAgents(
           this.adapter,
@@ -399,6 +402,17 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         }
 
         this.runtime.startStaleCheck();
+
+        if (!this.codexSessionTimer) {
+          const workspaceFolders = (wsFolders ?? []).map((folder) => folder.uri.fsPath);
+          if (workspaceFolders.length > 0) {
+            this.codexSessionTimer = startCodexSessionWatcher({
+              runtime: this.runtime,
+              store: this.store,
+              workspaceFolders,
+            });
+          }
+        }
 
         // Load furniture assets BEFORE sending layout
         (async () => {
@@ -704,6 +718,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose() {
+    if (this.codexSessionTimer) {
+      clearInterval(this.codexSessionTimer);
+      this.codexSessionTimer = null;
+    }
     this.pixelAgentsServer?.stop();
     this.pixelAgentsServer = null;
     this.runtime.dispose();

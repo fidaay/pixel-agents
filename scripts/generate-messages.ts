@@ -19,13 +19,15 @@
  */
 
 import { TypeScriptGenerator } from '@asyncapi/modelina';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const YAML_PATH = path.join(REPO_ROOT, 'core', 'asyncapi.yaml');
 const OUTPUT_PATH = path.join(REPO_ROOT, 'core', 'src', 'messages.ts');
+const PRETTIER_BIN = path.join(REPO_ROOT, 'node_modules', 'prettier', 'bin', 'prettier.cjs');
+const ESLINT_BIN = path.join(REPO_ROOT, 'node_modules', 'eslint', 'bin', 'eslint.js');
 
 const HEADER = `/**
  * AUTO-GENERATED FROM core/asyncapi.yaml. DO NOT EDIT MANUALLY.
@@ -106,7 +108,7 @@ async function main(): Promise<void> {
 
   // Format + lint --fix the generated file so the committed file passes CI.
   try {
-    execSync(`npx prettier --write ${quote(OUTPUT_PATH)}`, {
+    execFileSync(process.execPath, [PRETTIER_BIN, '--write', OUTPUT_PATH], {
       cwd: REPO_ROOT,
       stdio: 'inherit',
     });
@@ -115,7 +117,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   try {
-    execSync(`npx eslint --fix ${quote(path.relative(REPO_ROOT, OUTPUT_PATH))}`, {
+    execFileSync(process.execPath, [ESLINT_BIN, '--fix', path.relative(REPO_ROOT, OUTPUT_PATH)], {
       cwd: REPO_ROOT,
       stdio: 'inherit',
     });
@@ -134,10 +136,6 @@ function exportify(decl: string): string {
   const trimmed = decl.trimStart();
   if (trimmed.startsWith('export ')) return decl;
   return `export ${trimmed}`;
-}
-
-function quote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 main().catch((err) => {
