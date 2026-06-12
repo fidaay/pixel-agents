@@ -58,20 +58,95 @@ function isCodexSessionMetaRecord(record: Record<string, unknown>): boolean {
   return typeof record.payload.id === 'string';
 }
 
-function formatCodexToolStatus(toolName: string): string {
+const CODEX_THINKING_TOOL_NAME = 'codex_thinking';
+const CODEX_WRITING_TOOL_NAME = 'codex_message';
+const CODEX_WEB_SEARCH_TOOL_NAME = 'web_search';
+
+function parseCodexArguments(value: unknown): Record<string, unknown> {
+  if (isRecord(value)) return value;
+
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function shortCommandToken(value: string | undefined): string | null {
+  if (!value) return null;
+
+  const normalized = value
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/^\.?[\\/]/, '')
+    .replace(/\.(cmd|exe|ps1)$/i, '');
+  const parts = normalized.split(/[\\/]/);
+  const token = parts[parts.length - 1]?.trim();
+
+  return token || null;
+}
+
+function formatShellCommandStatus(commandValue: unknown): string {
+  if (typeof commandValue !== 'string') return 'Running command';
+
+  const command = commandValue.trim().replace(/\s+/g, ' ');
+  if (!command) return 'Running command';
+
+  const lower = command.toLowerCase();
+
+  if (lower.startsWith('$')) return 'Running PowerShell command';
+  if (/\brg(\.exe)?\b/.test(lower) || lower.includes('select-string')) return 'Searching files';
+  if (/^(get-content|cat|type)\b/i.test(command)) return 'Reading files';
+  if (/\bgit\s+status\b/.test(lower)) return 'Checking git status';
+  if (/\bgit\s+diff\b/.test(lower)) return 'Reviewing git diff';
+  if (/\bgit\s+log\b/.test(lower) || /\bgit\s+show\b/.test(lower)) return 'Reading git history';
+  if (/\bnpm\s+run\s+([^\s]+)/i.test(command)) {
+    const script = command.match(/\bnpm\s+run\s+([^\s]+)/i)?.[1];
+    return script ? `Running npm run ${script}` : 'Running npm script';
+  }
+  if (/\bnpm\s+(install|ci)\b/i.test(command)) return 'Installing npm dependencies';
+
+  const firstSegment = command.split(/[|;&]/)[0]?.trim() ?? command;
+  const tokens = firstSegment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const executable = shortCommandToken(tokens[0]);
+  const subcommand = shortCommandToken(tokens[1]);
+
+  if (!executable) return 'Running command';
+  if (executable.toLowerCase().includes('powershell') || executable.toLowerCase() === 'pwsh') {
+    return 'Running PowerShell command';
+  }
+
+  return subcommand ? `Running ${executable} ${subcommand}` : `Running ${executable}`;
+}
+
+function formatCodexToolStatus(toolName: string, args: Record<string, unknown> = {}): string {
   switch (toolName) {
     case 'shell_command':
-      return 'Running command';
+      return formatShellCommandStatus(args.command);
     case 'apply_patch':
       return 'Editing files';
     case 'spawn_agent':
-      return 'Subtask: Codex agent';
+      return typeof args.agent_type === 'string' && args.agent_type.trim()
+        ? `Subtask: ${args.agent_type.trim()} agent`
+        : 'Subtask: Codex agent';
     case 'wait_agent':
-      return 'Waiting for Codex agent';
+      return 'Waiting for agents';
     case 'close_agent':
-      return 'Closing Codex agent';
+      return 'Closing agent';
     case 'send_input':
-      return 'Messaging Codex agent';
+      return 'Messaging agent';
+    case 'tool_search':
+      return 'Searching tools';
+    case 'web_search':
+      return 'Searching web';
+    case 'js':
+      return typeof args.title === 'string' && args.title.trim()
+        ? `Running ${args.title.trim()}`
+        : 'Running JavaScript';
     case 'get_screenshot':
       return 'Capturing screenshot';
     case 'view_image':
@@ -79,6 +154,64 @@ function formatCodexToolStatus(toolName: string): string {
     default:
       return `Using ${toolName}`;
   }
+}
+
+function hasRealCodexToolActivity(agent: AgentState): boolean {
+  for (const toolId of agent.activeToolIds) {
+    if (toolId !== agent.codexSyntheticToolId) return true;
+  }
+
+  return false;
+}
+
+function clearCodexSyntheticActivity(
+  agentId: number,
+  agent: AgentState,
+  agents: AgentStateStore,
+): void {
+  const toolId = agent.codexSyntheticToolId;
+  if (!toolId) return;
+
+  agent.codexSyntheticToolId = undefined;
+  agent.activeToolIds.delete(toolId);
+  agent.activeToolStatuses.delete(toolId);
+  agent.activeToolNames.delete(toolId);
+  agents.broadcast({ type: 'agentToolDone', id: agentId, toolId });
+}
+
+function startCodexSyntheticActivity(
+  agentId: number,
+  agent: AgentState,
+  agents: AgentStateStore,
+  status: string,
+  toolName: string,
+): void {
+  if (hasRealCodexToolActivity(agent)) return;
+
+  agent.codexTurnCompletedAt = undefined;
+  const currentToolId = agent.codexSyntheticToolId;
+  if (currentToolId && agent.activeToolStatuses.get(currentToolId) === status) {
+    return;
+  }
+
+  clearCodexSyntheticActivity(agentId, agent, agents);
+
+  const toolId = `codex:${toolName}:${agent.linesProcessed}`;
+  agent.codexSyntheticToolId = toolId;
+  agent.activeToolIds.add(toolId);
+  agent.activeToolStatuses.set(toolId, status);
+  agent.activeToolNames.set(toolId, toolName);
+  agent.isWaiting = false;
+
+  agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+  agents.broadcast({
+    type: 'agentToolStart',
+    id: agentId,
+    toolId,
+    status,
+    toolName,
+    permissionActive: false,
+  });
 }
 
 function processCodexTranscriptRecord(
@@ -125,11 +258,36 @@ function processCodexTranscriptRecord(
   if (record.type === 'event_msg') {
     const payload = record.payload as { type?: string } | undefined;
 
-    if (payload?.type === 'task_started' || payload?.type === 'agent_message') {
+    if (payload?.type === 'task_started') {
       cancelWaitingTimer(agentId, waitingTimers);
       agent.isWaiting = false;
+      agent.codexTurnCompletedAt = undefined;
       agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+      startCodexSyntheticActivity(agentId, agent, agents, 'Thinking', CODEX_THINKING_TOOL_NAME);
+    } else if (payload?.type === 'agent_message') {
+      cancelWaitingTimer(agentId, waitingTimers);
+      startCodexSyntheticActivity(
+        agentId,
+        agent,
+        agents,
+        'Writing response',
+        CODEX_WRITING_TOOL_NAME,
+      );
     } else if (payload?.type === 'task_complete') {
+      clearCodexSyntheticActivity(agentId, agent, agents);
+      agent.codexTurnCompletedAt = Date.now();
+      agent.isWaiting = true;
+      agents.broadcast({ type: 'agentStatus', id: agentId, status: 'waiting' });
+    } else if (payload?.type === 'web_search_end') {
+      if (
+        agent.codexSyntheticToolId &&
+        agent.activeToolNames.get(agent.codexSyntheticToolId) === CODEX_WEB_SEARCH_TOOL_NAME
+      ) {
+        clearCodexSyntheticActivity(agentId, agent, agents);
+      }
+    } else if (payload?.type === 'turn_aborted') {
+      clearCodexSyntheticActivity(agentId, agent, agents);
+      agent.codexTurnCompletedAt = Date.now();
       agent.isWaiting = true;
       agents.broadcast({ type: 'agentStatus', id: agentId, status: 'waiting' });
     }
@@ -146,16 +304,25 @@ function processCodexTranscriptRecord(
         type?: string;
         name?: string;
         call_id?: string;
+        arguments?: unknown;
+        input?: unknown;
       }
     | undefined;
 
   if (!payload?.type) return true;
 
-  if (payload.type === 'function_call' && payload.name && payload.call_id) {
+  if (
+    (payload.type === 'function_call' || payload.type === 'custom_tool_call') &&
+    payload.name &&
+    payload.call_id
+  ) {
     const toolName = payload.name;
     const toolId = payload.call_id;
-    const status = formatCodexToolStatus(toolName);
+    const args = parseCodexArguments(payload.arguments ?? payload.input);
+    const status = formatCodexToolStatus(toolName, args);
 
+    clearCodexSyntheticActivity(agentId, agent, agents);
+    agent.codexTurnCompletedAt = undefined;
     cancelWaitingTimer(agentId, waitingTimers);
     agent.isWaiting = false;
     agent.hadToolsInTurn = true;
@@ -180,7 +347,50 @@ function processCodexTranscriptRecord(
     return true;
   }
 
-  if (payload.type === 'function_call_output' && payload.call_id) {
+  if (payload.type === 'tool_search_call' && payload.call_id) {
+    const toolName = 'tool_search';
+    const toolId = payload.call_id;
+    const status = formatCodexToolStatus(toolName, parseCodexArguments(payload.arguments));
+
+    clearCodexSyntheticActivity(agentId, agent, agents);
+    agent.codexTurnCompletedAt = undefined;
+    cancelWaitingTimer(agentId, waitingTimers);
+    agent.isWaiting = false;
+    agent.hadToolsInTurn = true;
+    agent.activeToolIds.add(toolId);
+    agent.activeToolStatuses.set(toolId, status);
+    agent.activeToolNames.set(toolId, toolName);
+
+    agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+    agents.broadcast({
+      type: 'agentToolStart',
+      id: agentId,
+      toolId,
+      status,
+      toolName,
+      permissionActive: false,
+    });
+
+    return true;
+  }
+
+  if (payload.type === 'web_search_call') {
+    startCodexSyntheticActivity(
+      agentId,
+      agent,
+      agents,
+      formatCodexToolStatus(CODEX_WEB_SEARCH_TOOL_NAME),
+      CODEX_WEB_SEARCH_TOOL_NAME,
+    );
+    return true;
+  }
+
+  if (
+    (payload.type === 'function_call_output' ||
+      payload.type === 'custom_tool_call_output' ||
+      payload.type === 'tool_search_output') &&
+    payload.call_id
+  ) {
     const toolId = payload.call_id;
     const toolName = agent.activeToolNames.get(toolId);
 
@@ -213,7 +423,19 @@ function processCodexTranscriptRecord(
     return true;
   }
 
+  if (payload.type === 'reasoning') {
+    startCodexSyntheticActivity(agentId, agent, agents, 'Thinking', CODEX_THINKING_TOOL_NAME);
+    return true;
+  }
+
   if (payload.type === 'message') {
+    startCodexSyntheticActivity(
+      agentId,
+      agent,
+      agents,
+      'Writing response',
+      CODEX_WRITING_TOOL_NAME,
+    );
     return true;
   }
 

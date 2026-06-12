@@ -58,6 +58,10 @@ export interface AgentState {
   leadAgentId?: number;
   /** True when lead spawns teammates via tmux (run_in_background Agent calls) */
   teamUsesTmux?: boolean;
+  /** Current synthetic Codex activity (reasoning / writing / web search), if any. */
+  codexSyntheticToolId?: string;
+  /** Timestamp when Codex reported the turn complete/aborted. Used for visual cleanup. */
+  codexTurnCompletedAt?: number;
 }
 
 export interface PersistedAgent {

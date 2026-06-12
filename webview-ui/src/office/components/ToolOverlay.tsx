@@ -27,6 +27,7 @@ interface ToolOverlayProps {
   officeState: OfficeState;
   agents: number[];
   agentTools: Record<number, ToolActivity[]>;
+  subagentTools: Record<number, Record<string, ToolActivity[]>>;
   subagentCharacters: SubagentCharacter[];
   containerRef: React.RefObject<HTMLDivElement | null>;
   zoom: number;
@@ -37,11 +38,10 @@ interface ToolOverlayProps {
 
 /** Derive a short human-readable activity string from tools/status */
 function getActivityText(
-  agentId: number,
-  agentTools: Record<number, ToolActivity[]>,
+  tools: ToolActivity[] | undefined,
   isActive: boolean,
+  fallback = 'Idle',
 ): string {
-  const tools = agentTools[agentId];
   if (tools && tools.length > 0) {
     // Find the latest non-done tool
     const activeTool = [...tools].reverse().find((t) => !t.done);
@@ -56,7 +56,7 @@ function getActivityText(
     }
   }
 
-  return 'Idle';
+  return fallback;
 }
 
 function getFuelColor(ratio: number): string {
@@ -70,6 +70,7 @@ export function ToolOverlay({
   officeState,
   agents,
   agentTools,
+  subagentTools,
   subagentCharacters,
   containerRef,
   zoom,
@@ -127,20 +128,21 @@ export function ToolOverlay({
 
         // Get activity text
         const subHasPermission = isSub && ch.bubbleType === 'permission';
+        const sub = isSub ? subagentCharacters.find((s) => s.id === id) : undefined;
+        const tools =
+          sub !== undefined ? subagentTools[sub.parentAgentId]?.[sub.parentToolId] : agentTools[id];
         let activityText: string;
         if (isSub) {
           if (subHasPermission) {
             activityText = 'Needs approval';
           } else {
-            const sub = subagentCharacters.find((s) => s.id === id);
-            activityText = sub ? sub.label : 'Subtask';
+            activityText = getActivityText(tools, ch.isActive, sub?.label || 'Subtask');
           }
         } else {
-          activityText = getActivityText(id, agentTools, ch.isActive);
+          activityText = getActivityText(tools, ch.isActive);
         }
 
         // Determine dot color
-        const tools = agentTools[id];
         const hasPermission = subHasPermission || tools?.some((t) => t.permissionWait && !t.done);
         const hasActiveTools = tools?.some((t) => !t.done);
         const isActive = ch.isActive;

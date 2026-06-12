@@ -110,6 +110,7 @@ export function useExtensionMessages(
 
   // Track whether initial layout has been loaded (ref to avoid re-render)
   const layoutReadyRef = useRef(false);
+  const subagentActiveToolsRef = useRef<Map<string, Set<string>>>(new Map());
 
   useEffect(() => {
     // Buffer agents from existingAgents until layout is loaded
@@ -384,6 +385,11 @@ export function useExtensionMessages(
         const parentToolId = msg.parentToolId as string;
         const toolId = msg.toolId as string;
         const status = msg.status as string;
+        const subagentKey = `${id}:${parentToolId}`;
+        const activeToolIds = subagentActiveToolsRef.current.get(subagentKey) ?? new Set<string>();
+        activeToolIds.add(toolId);
+        subagentActiveToolsRef.current.set(subagentKey, activeToolIds);
+
         setSubagentTools((prev) => {
           const agentSubs = prev[id] || {};
           const list = agentSubs[parentToolId] || [];
@@ -406,6 +412,14 @@ export function useExtensionMessages(
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
         const toolId = msg.toolId as string;
+        const subagentKey = `${id}:${parentToolId}`;
+        const activeToolIds = subagentActiveToolsRef.current.get(subagentKey);
+        activeToolIds?.delete(toolId);
+        const shouldMarkSubagentIdle = activeToolIds !== undefined && activeToolIds.size === 0;
+        if (shouldMarkSubagentIdle) {
+          subagentActiveToolsRef.current.delete(subagentKey);
+        }
+
         setSubagentTools((prev) => {
           const agentSubs = prev[id];
           if (!agentSubs) return prev;
@@ -419,9 +433,15 @@ export function useExtensionMessages(
             },
           };
         });
+        const subId = os.getSubagentId(id, parentToolId);
+        if (subId !== null && shouldMarkSubagentIdle) {
+          os.setAgentTool(subId, null);
+          os.setAgentActive(subId, false);
+        }
       } else if (msg.type === 'subagentClear') {
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
+        subagentActiveToolsRef.current.delete(`${id}:${parentToolId}`);
         setSubagentTools((prev) => {
           const agentSubs = prev[id];
           if (!agentSubs || !(parentToolId in agentSubs)) return prev;

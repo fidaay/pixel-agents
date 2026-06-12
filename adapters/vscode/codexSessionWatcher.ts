@@ -5,6 +5,8 @@ import * as path from 'path';
 import type { AgentRuntime } from '../../server/src/agentRuntime.js';
 import type { AgentStateStore } from '../../server/src/agentStateStore.js';
 import {
+  CODEX_COMPLETED_SESSION_RETIRE_MS,
+  CODEX_INACTIVE_SESSION_RETIRE_MS,
   EXTERNAL_SCAN_INTERVAL_MS,
   GLOBAL_SCAN_ACTIVE_MAX_AGE_MS,
 } from '../../server/src/constants.js';
@@ -26,9 +28,25 @@ interface CodexScanContext {
 }
 
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+const dormantCodexSessionMtimes = new Map<string, number>();
 
 function normalizePath(filePath: string): string {
   return path.resolve(filePath).toLowerCase();
+}
+
+function isDormantCodexSession(filePath: string, stat: fs.Stats): boolean {
+  const key = normalizePath(filePath);
+  const dormantMtime = dormantCodexSessionMtimes.get(key);
+
+  if (dormantMtime === undefined) return false;
+  if (stat.mtimeMs <= dormantMtime) return true;
+
+  dormantCodexSessionMtimes.delete(key);
+  return false;
+}
+
+function markCodexSessionDormant(filePath: string, stat: fs.Stats | null): void {
+  dormantCodexSessionMtimes.set(normalizePath(filePath), stat?.mtimeMs ?? Date.now());
 }
 
 function isInsideWorkspace(cwd: string | undefined, workspaceFolders: string[]): boolean {
@@ -123,6 +141,41 @@ function readSessionMeta(filePath: string): CodexSessionMeta | null {
   }
 }
 
+function getOffsetAfterSessionMeta(filePath: string): number {
+  let fd: number | null = null;
+
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buffer = Buffer.alloc(4096);
+    let offset = 0;
+
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
+      if (bytesRead <= 0) break;
+
+      const newlineIndex = buffer.subarray(0, bytesRead).indexOf(10);
+      if (newlineIndex >= 0) {
+        return offset + newlineIndex + 1;
+      }
+
+      offset += bytesRead;
+      if (offset > 262_144) break;
+    }
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return 0;
+}
+
 function isTracked(filePath: string, store: AgentStateStore): boolean {
   const normalizedFile = normalizePath(filePath);
 
@@ -133,6 +186,56 @@ function isTracked(filePath: string, store: AgentStateStore): boolean {
   }
 
   return false;
+}
+
+function hasActiveCodexActivity(agent: AgentState): boolean {
+  return agent.activeToolIds.size > 0 || agent.permissionSent;
+}
+
+function shouldRetireCodexAgent(agent: AgentState, now: number): boolean {
+  if (agent.providerId !== 'codex' || !agent.isExternal) return false;
+  if (hasActiveCodexActivity(agent)) return false;
+
+  if (
+    agent.codexTurnCompletedAt !== undefined &&
+    now - agent.codexTurnCompletedAt >= CODEX_COMPLETED_SESSION_RETIRE_MS
+  ) {
+    return true;
+  }
+
+  return now - agent.lastDataAt >= CODEX_INACTIVE_SESSION_RETIRE_MS;
+}
+
+function retireDormantCodexAgents(context: CodexScanContext): void {
+  const now = Date.now();
+  const toRemove: number[] = [];
+
+  for (const [id, agent] of context.store) {
+    if (shouldRetireCodexAgent(agent, now)) {
+      toRemove.push(id);
+    }
+  }
+
+  for (const id of toRemove) {
+    const agent = context.store.get(id);
+    if (!agent) continue;
+
+    let stat: fs.Stats | null = null;
+    try {
+      stat = fs.statSync(agent.jsonlFile);
+    } catch {
+      /* missing file is fine; removal still proceeds */
+    }
+
+    markCodexSessionDormant(agent.jsonlFile, stat);
+    context.runtime.knownJsonlFiles.delete(agent.jsonlFile);
+    context.runtime.unregisterAgent(agent.sessionId);
+    context.runtime.removeAgent(id);
+
+    console.log(
+      `[Pixel Agents] Codex: retired completed session ${path.basename(agent.jsonlFile)} (${agent.folderName ?? 'Codex'})`,
+    );
+  }
 }
 
 function buildFolderName(meta: CodexSessionMeta): string {
@@ -154,14 +257,7 @@ function adoptCodexSession(
 ): void {
   const { runtime, store } = context;
   const id = store.nextAgentId.current++;
-  let fileOffset = 0;
-
-  try {
-    const stat = fs.statSync(filePath);
-    fileOffset = stat.size;
-  } catch {
-    /* start from beginning if stat fails */
-  }
+  const fileOffset = getOffsetAfterSessionMeta(filePath);
 
   const agent: AgentState = {
     id,
@@ -216,12 +312,11 @@ function adoptCodexSession(
 function scanCodexSessions(context: CodexScanContext): void {
   if (!fs.existsSync(CODEX_SESSIONS_DIR)) return;
 
+  retireDormantCodexAgents(context);
+
   const now = Date.now();
 
   for (const filePath of getCodexSessionFiles(CODEX_SESSIONS_DIR)) {
-    if (context.runtime.knownJsonlFiles.has(filePath)) continue;
-    if (isTracked(filePath, context.store)) continue;
-
     let stat: fs.Stats;
     try {
       stat = fs.statSync(filePath);
@@ -229,6 +324,9 @@ function scanCodexSessions(context: CodexScanContext): void {
       continue;
     }
 
+    if (isDormantCodexSession(filePath, stat)) continue;
+    if (context.runtime.knownJsonlFiles.has(filePath)) continue;
+    if (isTracked(filePath, context.store)) continue;
     if (now - stat.mtimeMs > GLOBAL_SCAN_ACTIVE_MAX_AGE_MS) continue;
 
     const meta = readSessionMeta(filePath);

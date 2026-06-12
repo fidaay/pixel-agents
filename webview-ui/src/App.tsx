@@ -245,6 +245,7 @@ function App() {
             officeState={officeState}
             agents={agents}
             agentTools={agentTools}
+            subagentTools={subagentTools}
             subagentCharacters={subagentCharacters}
             containerRef={containerRef}
             zoom={editor.zoom}

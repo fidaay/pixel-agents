@@ -63,7 +63,12 @@ describe('Codex transcript parsing', () => {
       agent.id,
       JSON.stringify({
         type: 'response_item',
-        payload: { type: 'function_call', name: 'shell_command', call_id: 'call-1' },
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call-1',
+          arguments: JSON.stringify({ command: 'git status --short --branch' }),
+        },
       }),
       store,
       waitingTimers,
@@ -71,13 +76,13 @@ describe('Codex transcript parsing', () => {
     );
 
     expect(agent.activeToolIds.has('call-1')).toBe(true);
-    expect(agent.activeToolStatuses.get('call-1')).toBe('Running command');
+    expect(agent.activeToolStatuses.get('call-1')).toBe('Checking git status');
     expect(broadcasts).toContainEqual({ type: 'agentStatus', id: agent.id, status: 'active' });
     expect(broadcasts).toContainEqual({
       type: 'agentToolStart',
       id: agent.id,
       toolId: 'call-1',
-      status: 'Running command',
+      status: 'Checking git status',
       toolName: 'shell_command',
       permissionActive: false,
     });
@@ -101,6 +106,167 @@ describe('Codex transcript parsing', () => {
       id: agent.id,
       toolId: 'call-1',
     });
+  });
+
+  it('shows Codex reasoning and message records as synthetic activity', () => {
+    const agent = createAgent({ providerId: 'codex' });
+    const { broadcasts, store } = setupStore(agent);
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'response_item',
+        payload: { type: 'reasoning', summary: [] },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    const thinkingToolId = agent.codexSyntheticToolId;
+
+    expect(thinkingToolId).toBeTruthy();
+    expect(agent.activeToolStatuses.get(thinkingToolId!)).toBe('Thinking');
+    expect(broadcasts).toContainEqual(
+      expect.objectContaining({
+        type: 'agentToolStart',
+        status: 'Thinking',
+        toolName: 'codex_thinking',
+      }),
+    );
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [] },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    expect(broadcasts).toContainEqual({
+      type: 'agentToolDone',
+      id: agent.id,
+      toolId: thinkingToolId,
+    });
+    expect(agent.activeToolStatuses.get(agent.codexSyntheticToolId!)).toBe('Writing response');
+    expect(broadcasts).toContainEqual(
+      expect.objectContaining({
+        type: 'agentToolStart',
+        status: 'Writing response',
+        toolName: 'codex_message',
+      }),
+    );
+  });
+
+  it('clears Codex synthetic activity when the turn completes', () => {
+    const agent = createAgent({ providerId: 'codex' });
+    const { broadcasts, store } = setupStore(agent);
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_started' },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    const thinkingToolId = agent.codexSyntheticToolId;
+    expect(agent.activeToolStatuses.get(thinkingToolId!)).toBe('Thinking');
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete' },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    expect(agent.codexSyntheticToolId).toBeUndefined();
+    expect(agent.codexTurnCompletedAt).toBeGreaterThan(0);
+    expect(agent.isWaiting).toBe(true);
+    expect(broadcasts).toContainEqual({
+      type: 'agentToolDone',
+      id: agent.id,
+      toolId: thinkingToolId,
+    });
+    expect(broadcasts).toContainEqual({ type: 'agentStatus', id: agent.id, status: 'waiting' });
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_started' },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    expect(agent.codexTurnCompletedAt).toBeUndefined();
+  });
+
+  it('maps Codex custom tools and tool search calls to concrete statuses', () => {
+    const agent = createAgent({ providerId: 'codex' });
+    const { broadcasts, store } = setupStore(agent);
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          name: 'apply_patch',
+          call_id: 'patch-1',
+          input: '*** Begin Patch\n*** End Patch',
+        },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    processTranscriptLine(
+      agent.id,
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'tool_search_call',
+          call_id: 'search-1',
+          arguments: JSON.stringify({ query: 'spawn agent' }),
+        },
+      }),
+      store,
+      new Map(),
+      new Map(),
+    );
+
+    expect(agent.activeToolStatuses.get('patch-1')).toBe('Editing files');
+    expect(agent.activeToolStatuses.get('search-1')).toBe('Searching tools');
+    expect(broadcasts).toContainEqual(
+      expect.objectContaining({
+        type: 'agentToolStart',
+        toolId: 'patch-1',
+        status: 'Editing files',
+        toolName: 'apply_patch',
+      }),
+    );
+    expect(broadcasts).toContainEqual(
+      expect.objectContaining({
+        type: 'agentToolStart',
+        toolId: 'search-1',
+        status: 'Searching tools',
+        toolName: 'tool_search',
+      }),
+    );
   });
 
   it('does not treat non-Codex response_item records as Codex tool calls', () => {

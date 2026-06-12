@@ -9,7 +9,9 @@ const CODEX_READING_TOOLS = new Set([
   'list_mcp_resources',
   'read_mcp_resource',
   'snapshot_layout',
+  'tool_search',
   'view_image',
+  'web_search',
 ]);
 
 export const CODEX_SUBAGENT_TOOL_NAMES = new Set(['spawn_agent']);

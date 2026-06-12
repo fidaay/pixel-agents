@@ -35,6 +35,14 @@ export const GLOBAL_SCAN_ACTIVE_MIN_SIZE = 3_072; // 3KB
 /** Only adopt global JSONL files modified within this window */
 export const GLOBAL_SCAN_ACTIVE_MAX_AGE_MS = 600_000; // 10 minutes
 
+// ── Codex session cleanup ───────────────────────────────────
+/** Hide completed Codex sessions after a short grace period so the office
+ *  does not keep closed subagents around as idle characters. */
+export const CODEX_COMPLETED_SESSION_RETIRE_MS = 30_000;
+/** Safety cleanup for Codex sessions that stop emitting data without a final
+ *  task_complete event. Files are re-adopted if their mtime changes later. */
+export const CODEX_INACTIVE_SESSION_RETIRE_MS = 120_000;
+
 // ── Display Truncation + Pixel Agents Server paths ──────────
 // Centralized in core/src/constants.ts; re-exported here for back-compat.
 export {

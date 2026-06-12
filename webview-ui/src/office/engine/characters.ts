@@ -45,6 +45,27 @@ function directionBetween(
   return Direction.UP;
 }
 
+function pickIdleWanderTarget(
+  ch: Character,
+  walkableTiles: Array<{ col: number; row: number }>,
+  seats: Map<string, Seat>,
+): { col: number; row: number } | null {
+  if (walkableTiles.length === 0) return null;
+
+  const seatTiles = new Set<string>();
+  for (const seat of seats.values()) {
+    seatTiles.add(`${seat.seatCol},${seat.seatRow}`);
+  }
+
+  const socialTiles = walkableTiles.filter((tile) => {
+    if (seatTiles.has(`${tile.col},${tile.row}`)) return false;
+    return Math.abs(tile.col - ch.tileCol) + Math.abs(tile.row - ch.tileRow) >= 3;
+  });
+  const candidates = socialTiles.length > 0 ? socialTiles : walkableTiles;
+
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
 export function createCharacter(
   id: number,
   palette: number,
@@ -110,11 +131,14 @@ export function updateCharacter(
           ch.seatTimer -= dt;
           break;
         }
+        const shouldLeaveSeatSoon = ch.seatTimer < 0;
         ch.seatTimer = 0; // clear sentinel
         ch.state = CharacterState.IDLE;
         ch.frame = 0;
         ch.frameTimer = 0;
-        ch.wanderTimer = randomRange(WANDER_PAUSE_MIN_SEC, WANDER_PAUSE_MAX_SEC);
+        ch.wanderTimer = shouldLeaveSeatSoon
+          ? randomRange(0.2, 1.6)
+          : randomRange(WANDER_PAUSE_MIN_SEC, WANDER_PAUSE_MAX_SEC);
         ch.wanderCount = 0;
         ch.wanderLimit = randomInt(WANDER_MOVES_BEFORE_REST_MIN, WANDER_MOVES_BEFORE_REST_MAX);
       }
@@ -163,30 +187,8 @@ export function updateCharacter(
       // Countdown wander timer
       ch.wanderTimer -= dt;
       if (ch.wanderTimer <= 0) {
-        // Check if we've wandered enough — return to seat for a rest
-        if (ch.wanderCount >= ch.wanderLimit && ch.seatId) {
-          const seat = seats.get(ch.seatId);
-          if (seat) {
-            const path = findPath(
-              ch.tileCol,
-              ch.tileRow,
-              seat.seatCol,
-              seat.seatRow,
-              tileMap,
-              blockedTiles,
-            );
-            if (path.length > 0) {
-              ch.path = path;
-              ch.moveProgress = 0;
-              ch.state = CharacterState.WALK;
-              ch.frame = 0;
-              ch.frameTimer = 0;
-              break;
-            }
-          }
-        }
-        if (walkableTiles.length > 0) {
-          const target = walkableTiles[Math.floor(Math.random() * walkableTiles.length)];
+        const target = pickIdleWanderTarget(ch, walkableTiles, seats);
+        if (target) {
           const path = findPath(
             ch.tileCol,
             ch.tileRow,
@@ -203,6 +205,10 @@ export function updateCharacter(
             ch.frameTimer = 0;
             ch.wanderCount++;
           }
+        }
+        if (ch.wanderCount >= ch.wanderLimit) {
+          ch.wanderCount = 0;
+          ch.wanderLimit = randomInt(WANDER_MOVES_BEFORE_REST_MIN, WANDER_MOVES_BEFORE_REST_MAX);
         }
         ch.wanderTimer = randomRange(WANDER_PAUSE_MIN_SEC, WANDER_PAUSE_MAX_SEC);
       }
